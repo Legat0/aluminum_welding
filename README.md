@@ -89,7 +89,7 @@ jupyter notebook weld_pool_axi.ipynb
 | Файл | Назначение |
 |---|---|
 | `weldpool_axi.py` | MAC \((r,z)\), VOF, CSF, Дарси, пинч / \(\mathbf{J}\times\mathbf{B}\), энергия |
-| `weld_pool_axi.ipynb` | Постановка, `QUICK`-прогон, кадры \(\alpha\)/\(T\), шейка, проверки объёма |
+| `weld_pool_axi.ipynb` | Постановка, выбор `MeshLevel` (quick/normal/fine), кадры \(\alpha\)/\(T\), шейка |
 
 ## 3D с движущимся электродом — `heat+flow+em_3d`
 

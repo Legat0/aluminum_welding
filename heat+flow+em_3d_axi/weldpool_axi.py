@@ -2,18 +2,27 @@
 # Single-grid VOF: consumable wire, hanging drop, free-surface pool.
 # EM in metal only (pinch in wire/drop, potential in pool). No arc plasma.
 # Default properties: Al 5182 (Zhao & DebRoy 2001).
-# Domain: r from axis, z from plate bottom (z=0) upward.
+# Domain: r from axis; z=0 plate top (free surface), plate in z<0, gas/wire in z>0.
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Optional, Tuple
+from enum import Enum
+from typing import Callable, Optional, Tuple, Union
 import time
 import warnings
 
 import numpy as np
 from scipy import sparse
-from scipy.sparse.linalg import spsolve
+from scipy.sparse.linalg import factorized, spsolve
+
+
+class MeshLevel(str, Enum):
+    """Preset grid / time resolution for demos."""
+
+    quick = "quick"
+    normal = "normal"
+    fine = "fine"
 
 
 MU0 = 4.0e-7 * np.pi
@@ -49,23 +58,23 @@ class Material:
 @dataclass
 class Process:
     Lr: float = 0.006
-    Lz: float = 0.010
+    Lz: float = 0.007  # gas/wire height above z=0 (surface)
     nr: int = 48
     nz: int = 80
-    H_plate: float = 0.003
+    H_plate: float = 0.004  # plate thickness; bottom at z=-H_plate
     R_wire: float = 0.0006
-    z_wire_tip: float = 0.0075  # initial solid tip z (above plate)
-    R_drop0: float = 0.0011  # initial hanging-drop radius (near critical)
-    v_feed: float = 0.05  # m/s wire feed (downward)
-    I_arc: float = 160.0  # A
-    U_anode: float = 4.0  # V equivalent anode fall (heat on drop surface)
-    P_arc: float = 1800.0  # W Gaussian heat on pool surface
+    z_wire_tip: float = 0.0040  # solid tip z (above surface z=0)
+    R_drop0: float = 0.00095  # hanging-drop radius (sub-critical for softer impact)
+    v_feed: float = 0.04  # m/s wire feed (downward, -z)
+    I_arc: float = 150.0  # A
+    U_anode: float = 3.5  # V equivalent anode fall (heat on drop surface)
+    P_arc: float = 1400.0  # W Gaussian heat on pool surface
     r_b: float = 0.0025
-    p_arc_max: float = 300.0  # Pa peak arc pressure on pool
+    p_arc_max: float = 80.0  # Pa peak arc pressure (mild crater)
     T0: float = 300.0
     Ta: float = 300.0
-    T_wire: float = 900.0  # wire / drop initial temperature (near melt)
-    T_drop: float = 1200.0
+    T_wire: float = 880.0
+    T_drop: float = 1100.0
     h_conv: float = 20.0
     h_bottom: float = 50.0
     emissivity: float = 0.4
@@ -76,9 +85,11 @@ class Process:
     dt_max: float = 5.0e-5
     t_end: float = 0.020
     em_every: int = 3  # EM solve every N hydro steps
+    proj_rebuild_every: int = 5  # rebuild/factorize pressure matrix every N steps
     alpha_metal: float = 0.5  # threshold for metal mask
-    u_clip: float = 5.0  # m/s hard velocity limiter (demo stability)
-    F_em_clip: float = 5.0e6  # N/m³ Lorentz force cap
+    u_clip: float = 3.0  # m/s hard velocity limiter (demo stability)
+    F_em_clip: float = 3.0e6  # N/m³ Lorentz force cap
+    F_csf_clip: float = 2.0e7  # N/m³ CSF clip (allow stronger smoothing than EM)
 
 
 @dataclass
@@ -112,15 +123,17 @@ class WeldPoolAxi:
     # ------------------------------------------------------------------ grid
     def _build_grid(self) -> None:
         p = self.proc
+        # z=0 surface; plate [-H_plate, 0], gas/wire [0, Lz]
+        self.z_min = -p.H_plate
+        self.z_max = p.Lz
+        L_tot = p.H_plate + p.Lz
         self.dr = p.Lr / p.nr
-        self.dz = p.Lz / p.nz
+        self.dz = L_tot / p.nz
         self.rc = (np.arange(p.nr) + 0.5) * self.dr
-        self.zc = (np.arange(p.nz) + 0.5) * self.dz
-        self.ru = np.arange(p.nr + 1) * self.dr  # radial faces
-        self.zw = np.arange(p.nz + 1) * self.dz  # axial faces
+        self.zc = self.z_min + (np.arange(p.nz) + 0.5) * self.dz
+        self.ru = np.arange(p.nr + 1) * self.dr
+        self.zw = self.z_min + np.arange(p.nz + 1) * self.dz
         self.R, self.Z = np.meshgrid(self.rc, self.zc, indexing="ij")
-        # cell "volume" factor 2π r Δr Δz — use 2π r for integrals
-        self.cell_area = 2.0 * np.pi * self.rc[:, None] * self.dr * self.dz  # (nr,1)*(1)->broadcast
         self.cell_area = 2.0 * np.pi * self.R * self.dr * self.dz
 
     def reset(self) -> None:
@@ -128,6 +141,8 @@ class WeldPoolAxi:
         m = self.mat
         self.t = 0.0
         self._step_count = 0
+        self._proj_solve = None
+        self._proj_built_at = -10**9
         self.alpha = np.zeros((p.nr, p.nz), dtype=np.float64)
         self.T = np.full((p.nr, p.nz), p.T0, dtype=np.float64)
         self.fL = np.zeros((p.nr, p.nz), dtype=np.float64)
@@ -153,42 +168,37 @@ class WeldPoolAxi:
         self._update_masks()
 
     def _init_geometry(self) -> None:
-        """Plate + wire + hanging spherical drop nearly critical."""
+        """Plate (z≤0) + wire + hanging drop above the free surface z=0."""
         p = self.proc
         m = self.mat
         R, Z = self.R, self.Z
 
-        # plate
-        plate = Z <= p.H_plate
+        # plate: z in [-H_plate, 0]
+        plate = Z <= 0.0
         self.alpha[plate] = 1.0
         self.T[plate] = p.T0
 
-        # solid wire column from tip up to domain top
+        # solid wire from tip up to domain top
         wire = (R <= p.R_wire) & (Z >= p.z_wire_tip)
         self.alpha[wire] = 1.0
         self.T[wire] = p.T_wire
-        # feed velocity in solid wire
         self.w[:, :] = 0.0
         for j in range(p.nz + 1):
-            z_face = self.zw[j]
-            if z_face >= p.z_wire_tip:
+            if self.zw[j] >= p.z_wire_tip:
                 self.w[R[:, 0] <= p.R_wire, j] = -p.v_feed
 
-        # hanging drop: sphere centred on axis below tip
-        z_c = p.z_wire_tip - 0.15 * p.R_drop0
+        # hanging drop below tip, above plate surface
+        z_c = p.z_wire_tip - 0.25 * p.R_drop0
         drop = (R**2 + (Z - z_c) ** 2) <= p.R_drop0**2
-        drop &= Z > p.H_plate  # not overlapping solid plate top
+        drop &= Z > 0.0
         drop &= Z < p.z_wire_tip + 0.5 * p.R_wire
         self.alpha[drop] = np.maximum(self.alpha[drop], 1.0)
         self.T[drop] = p.T_drop
-
-        # smooth plate top free surface slightly recessed under arc (optional pool seed)
-        # leave plate surface flat; melting creates free surface motion later
         self.alpha = np.clip(self.alpha, 0.0, 1.0)
 
-        # melt a shallow pool seed under the arc so free surface can deform
-        pool_seed = (Z <= p.H_plate) & (Z >= p.H_plate - 0.8e-3) & (R <= 2.0 * p.r_b)
-        self.T[pool_seed] = m.T_liquidus + 80.0
+        # shallow melt seed near surface (not deep burn-through)
+        pool_seed = (Z <= 0.0) & (Z >= -0.4e-3) & (R <= 1.5 * p.r_b)
+        self.T[pool_seed] = m.T_liquidus + 40.0
         self.fL = self.liquid_fraction(self.T)
 
     # ----------------------------------------------------------- properties
@@ -267,10 +277,11 @@ class WeldPoolAxi:
             seed_w[(self.rc <= p.R_wire) & metal[:, jj], jj] = True
         self.wire_mask = self._flood_fill(seed_w)
 
-        # pool seed: bottom plate region
+        # pool seed: plate metal (z ≤ 0)
         seed_p = np.zeros_like(metal)
-        j_plate = int(np.clip(np.searchsorted(self.zc, p.H_plate) - 1, 0, p.nz - 1))
-        seed_p[:, : max(j_plate + 1, 1)] = metal[:, : max(j_plate + 1, 1)]
+        seed_p[metal & (self.Z <= 0.05e-3)] = True
+        if not np.any(seed_p):
+            seed_p[:, 0] = metal[:, 0]
         self.pool_mask = self._flood_fill(seed_p)
 
         # free / flying metal = metal not connected to wire or pool
@@ -305,13 +316,12 @@ class WeldPoolAxi:
         return mask
 
     def neck_radius(self) -> float:
-        """Minimum metal radius along wire+drop column above the plate."""
+        """Minimum metal radius along wire+drop column above the plate (z>0)."""
         p = self.proc
         thr = p.alpha_metal
         metal = self.alpha >= thr
-        # look in gap between plate and top
-        j0 = int(np.searchsorted(self.zc, p.H_plate + 0.2e-3))
-        j1 = int(np.searchsorted(self.zc, min(p.z_wire_tip + p.R_drop0, p.Lz - self.dz)))
+        j0 = int(np.searchsorted(self.zc, 0.2e-3))
+        j1 = int(np.searchsorted(self.zc, min(p.z_wire_tip + p.R_drop0, self.z_max - self.dz)))
         j0 = max(0, j0)
         j1 = min(p.nz, max(j0 + 1, j1))
         r_min = p.R_wire
@@ -320,7 +330,6 @@ class WeldPoolAxi:
             cols = np.where(metal[:, j])[0]
             if cols.size == 0:
                 continue
-            # only consider if connected to wire path (wire_mask or nearby)
             if not (self.wire_mask[:, j].any() or self.drop_mask[:, j].any()):
                 continue
             r_outer = float(self.rc[cols.max()] + 0.5 * self.dr)
@@ -329,16 +338,18 @@ class WeldPoolAxi:
         return float(r_min) if found else 0.0
 
     def pool_depression(self) -> float:
-        """Depth of free-surface dip on axis relative to H_plate."""
-        p = self.proc
-        thr = p.alpha_metal
-        # find top metal cell on axis (i=0)
+        """Depth of free-surface dip on axis below z=0 (positive into the plate)."""
+        thr = self.proc.alpha_metal
         metal_axis = self.alpha[0, :] >= thr
         if not np.any(metal_axis):
             return 0.0
-        j_top = int(np.where(metal_axis)[0].max())
+        # free-surface height ≈ uppermost metal cell near the plate
+        plate_js = np.where(metal_axis & (self.zc <= 1.0e-3))[0]
+        if plate_js.size == 0:
+            return 0.0
+        j_top = int(plate_js.max())
         z_top = float(self.zc[j_top] + 0.5 * self.dz * (2.0 * self.alpha[0, j_top] - 1.0))
-        return float(max(0.0, p.H_plate - z_top))
+        return float(max(0.0, -z_top))
 
     # ------------------------------------------------------------------- EM
     def _metal_radius_profile(self, mask: np.ndarray) -> np.ndarray:
@@ -354,7 +365,7 @@ class WeldPoolAxi:
         return Rm
 
     def _compute_pinch(self) -> None:
-        """Analytical pinch force in wire-connected metal."""
+        """Analytical pinch force in wire-connected metal (vectorized)."""
         p = self.proc
         self.Fr[:] = 0.0
         self.Fz[:] = 0.0
@@ -369,24 +380,21 @@ class WeldPoolAxi:
             return
         Rm = self._metal_radius_profile(mask)
         Rm_min = max(0.75 * self.dr, 0.15 * p.R_wire)
+        Rm_eff = np.where(Rm > 0.0, np.maximum(Rm, Rm_min), 0.0)
         I = p.I_arc
-        for j in range(p.nz):
-            Rm_j = max(Rm[j], Rm_min) if Rm[j] > 0.0 else 0.0
-            if Rm_j < 1e-6:
-                continue
-            for i in range(p.nr):
-                if not mask[i, j]:
-                    continue
-                r = self.rc[i]
-                if r > Rm_j:
-                    continue
-                Jz = I / (np.pi * Rm_j**2)
-                Bth = MU0 * I * r / (2.0 * np.pi * Rm_j**2)
-                Fr = -Jz * Bth
-                Fr = float(np.clip(Fr, -p.F_em_clip, p.F_em_clip))
-                self.Jz[i, j] = Jz
-                self.Bth[i, j] = Bth
-                self.Fr[i, j] = Fr
+        good = Rm_eff > 1e-6
+        Jz_col = np.zeros_like(Rm_eff)
+        Jz_col[good] = I / (np.pi * Rm_eff[good] ** 2)
+        r = self.rc[:, None]
+        Rm_b = Rm_eff[None, :]
+        inside = mask & good[None, :] & (r <= Rm_b)
+        self.Jz = np.where(inside, Jz_col[None, :], 0.0)
+        self.Bth = np.where(
+            inside,
+            MU0 * I * r / (2.0 * np.pi * np.maximum(Rm_b, 1e-16) ** 2),
+            0.0,
+        )
+        self.Fr = np.clip(-self.Jz * self.Bth, -p.F_em_clip, p.F_em_clip)
 
     def _compute_pool_em(self) -> None:
         """Potential solve in pool metal grounded at the bottom; add J×B.
@@ -435,7 +443,7 @@ class WeldPoolAxi:
 
         surf = np.zeros_like(active)
         for i, j in zip(*np.where(active)):
-            if (j + 1 >= nz or not active[i, j + 1]) and self.zc[j] >= p.H_plate - 2.0e-3:
+            if (j + 1 >= nz or not active[i, j + 1]) and self.zc[j] >= -2.0e-3:
                 surf[i, j] = True
 
         src_vol = np.zeros((nr, nz))
@@ -530,12 +538,8 @@ class WeldPoolAxi:
             Jr[i, j] = -se[i, j] * dphdr
             Jz[i, j] = -se[i, j] * dphdz
 
-        Bth = np.zeros((nr, nz))
-        for j in range(nz):
-            integ = 0.0
-            for i in range(nr):
-                integ += Jz[i, j] * self.rc[i] * dr
-                Bth[i, j] = MU0 * integ / (self.rc[i] + 1e-16)
+        integ = np.cumsum(Jz * self.rc[:, None] * dr, axis=0)
+        Bth = MU0 * integ / (self.rc[:, None] + 1e-16)
 
         pool_only = active & ~self.wire_mask
         self.Jr[pool_only] = Jr[pool_only]
@@ -643,6 +647,43 @@ class WeldPoolAxi:
             alpha2[top_wire, -2] = np.maximum(alpha2[top_wire, -2], 0.99)
 
         self.alpha = alpha2
+        self._repair_plate_vof()
+
+    def _repair_plate_vof(self) -> None:
+        """Kill spurious gas pockets inside the cold plate / on the bottom wall.
+
+        Upwind VOF + clip can advect α<1 into the solid after a droplet impact;
+        the impermeable bottom then traps a fake void. Force α=1 in solid plate
+        metal and on the lowest rows.
+        """
+        m = self.mat
+        # cold solid inside the plate (below free surface)
+        solid_plate = (self.Z <= 0.0) & (self.T < m.T_solidus)
+        self.alpha[solid_plate] = 1.0
+        # never allow gas on the bottom boundary row(s)
+        self.alpha[:, 0] = 1.0
+        if self.proc.nz >= 2:
+            # second row: only if still cold / not a through-melt open crater
+            cold2 = self.T[:, 1] < m.T_liquidus
+            self.alpha[cold2, 1] = np.maximum(self.alpha[cold2, 1], 1.0)
+        self.alpha[:] = np.clip(self.alpha, 0.0, 1.0)
+
+    def _freeze_solid_velocity(self) -> None:
+        """Zero flow in cold solid plate so VOF cannot dig voids downward."""
+        m = self.mat
+        solid = (self.Z <= 0.0) & (self.T < m.T_solidus) & (self.alpha >= self.proc.alpha_metal)
+        u_kill = np.zeros(self.u.shape, dtype=bool)
+        u_kill[0, :] = solid[0, :]
+        u_kill[-1, :] = solid[-1, :]
+        if self.proc.nr >= 2:
+            u_kill[1:-1, :] = solid[:-1, :] | solid[1:, :]
+        self.u[u_kill] = 0.0
+        w_kill = np.zeros(self.w.shape, dtype=bool)
+        w_kill[:, 0] = True
+        if self.proc.nz >= 2:
+            w_kill[:, 1:-1] = solid[:, :-1] | solid[:, 1:]
+            w_kill[:, -1] = solid[:, -1]
+        self.w[w_kill] = 0.0
 
     def _apply_wire_feed(self, dt: float) -> None:
         """Impose downward feed velocity in solid wire; accumulate fed volume."""
@@ -650,7 +691,7 @@ class WeldPoolAxi:
         m = self.mat
         solid_wire = self.wire_mask & (self.T < m.T_solidus + 5.0) & (self.alpha >= p.alpha_metal)
         # also always feed at top inlet
-        inlet = (self.R <= p.R_wire) & (self.Z >= p.Lz - 2.5 * self.dz)
+        inlet = (self.R <= p.R_wire) & (self.Z >= self.z_max - 2.5 * self.dz)
         feed_region = solid_wire | inlet
         # set w on faces inside feed column
         for i in range(p.nr):
@@ -682,17 +723,16 @@ class WeldPoolAxi:
         alpha = self.alpha
         ar, az = self._youngs_normal(alpha)
         kappa = self._curvature(alpha)
-        # CSF: σ κ ∇α (scaled for coarse-grid stability)
+        # CSF: σ κ ∇α
         Fr = m.sigma * kappa * ar
         Fz = m.sigma * kappa * az
-        Fcap = 2.0 * p.F_em_clip
-        Fr = np.clip(Fr, -Fcap, Fcap)
-        Fz = np.clip(Fz, -Fcap, Fcap)
+        Fcsf = getattr(p, "F_csf_clip", 2.0e7)
+        Fr = np.clip(Fr, -Fcsf, Fcsf)
+        Fz = np.clip(Fz, -Fcsf, Fcsf)
 
-        # Marangoni: (dσ/dT)(∇_s T)|∇α| approximately as (dσ/dT) ∇T projected
+        # Marangoni
         fL = self.fL
-        Tr, Tz = self._youngs_normal(self.T)  # reuse gradient helper
-        # tangential ≈ ∇T - (∇T·n) n
+        Tr, Tz = self._youngs_normal(self.T)
         mag = np.sqrt(ar**2 + az**2) + 1e-14
         nr_c, nz_c = ar / mag, az / mag
         dT_n = Tr * nr_c + Tz * nz_c
@@ -702,13 +742,10 @@ class WeldPoolAxi:
         Fr += mar * Tr_t * mag
         Fz += mar * Tz_t * mag
 
-        # Arc pressure on pool free surface: p_arc n |∇α|
+        # Arc pressure near free surface z≈0
         if p.p_arc_max > 0.0:
             p_arc = p.p_arc_max * np.exp(-3.0 * (self.R / p.r_b) ** 2)
-            # only near plate free surface
-            near_pool = self.pool_mask | (
-                (self.Z <= p.H_plate + 1.5e-3) & (self.Z >= p.H_plate - 2e-3)
-            )
+            near_pool = self.pool_mask | ((self.Z <= 1.5e-3) & (self.Z >= -2.5e-3))
             Fr += p_arc * ar * near_pool
             Fz += p_arc * az * near_pool
 
@@ -733,94 +770,73 @@ class WeldPoolAxi:
         u_star = u.copy()
         w_star = w.copy()
 
-        # --- u_r faces (i=1..nr-1 interior; i=0 axis = 0; i=nr wall = 0)
-        for i in range(1, nr):
-            r_f = self.ru[i]
-            # stagger density / viscosity / forces
-            rho_f = 0.5 * (rho[i - 1, :] + rho[i, :])
-            mu_f = 0.5 * (mu[i - 1, :] + mu[i, :])
-            A_f = 0.5 * (A_darcy[i - 1, :] + A_darcy[i, :])
-            Fr_f = 0.5 * (Fr_s[i - 1, :] + Fr_s[i, :]) + 0.5 * (self.Fr[i - 1, :] + self.Fr[i, :])
-
-            ui = u[i, :]
-            # neighbours
-            ue = u[i + 1, :] if i + 1 <= nr else 0.0
-            uw = u[i - 1, :]
-            # upwind advection (axisymmetric)
-            u_c = ui
-            # approximate cell-centre velocities at face
-            w_adv = 0.5 * (
-                0.5 * (w[i - 1, :-1] + w[i - 1, 1:]) + 0.5 * (w[i, :-1] + w[i, 1:])
+        # --- u_r faces i=1..nr-1 (vectorized)
+        if nr >= 2:
+            rho_f = 0.5 * (rho[:-1, :] + rho[1:, :])
+            mu_f = 0.5 * (mu[:-1, :] + mu[1:, :])
+            A_f = 0.5 * (A_darcy[:-1, :] + A_darcy[1:, :])
+            Fr_f = 0.5 * (Fr_s[:-1, :] + Fr_s[1:, :]) + 0.5 * (self.Fr[:-1, :] + self.Fr[1:, :])
+            ui = u[1:-1, :]
+            ue = u[2:, :]
+            uw = u[:-2, :]
+            r_f = self.ru[1:-1, None]
+            w_adv = 0.25 * (
+                w[:-1, :-1] + w[:-1, 1:] + w[1:, :-1] + w[1:, 1:]
             )
-            # radial upwind
-            dudr = np.where(u_c >= 0.0, (ui - uw) / dr, (ue - ui) / dr)
-            # axial
-            ut = np.empty(nz)
-            ub = np.empty(nz)
-            ut[:-1] = ui[1:]
-            ut[-1] = ui[-1]
-            ub[1:] = ui[:-1]
-            ub[0] = ui[0]
+            dudr = np.where(ui >= 0.0, (ui - uw) / dr, (ue - ui) / dr)
+            ut = np.empty_like(ui)
+            ub = np.empty_like(ui)
+            ut[:, :-1] = ui[:, 1:]
+            ut[:, -1] = ui[:, -1]
+            ub[:, 1:] = ui[:, :-1]
+            ub[:, 0] = ui[:, 0]
             dudz = np.where(w_adv >= 0.0, (ui - ub) / dz, (ut - ui) / dz)
-            adv = u_c * dudr + w_adv * dudz
-
-            # viscosity laplacian (simplified)
+            adv = ui * dudr + w_adv * dudz
             d2r = (ue - 2.0 * ui + uw) / dr**2
             d2z = (ut - 2.0 * ui + ub) / dz**2
-            # geometric term -u/r^2 for axisymmetric
             visc = (mu_f / rho_f) * (d2r + d2z - ui / (r_f**2 + 1e-16))
-
             body = Fr_f / rho_f
-            u_star[i, :] = (ui + dt * (-adv + visc + body)) / (1.0 + dt * A_f / rho_f)
+            u_star[1:-1, :] = (ui + dt * (-adv + visc + body)) / (1.0 + dt * A_f / rho_f)
 
         u_star[0, :] = 0.0
         u_star[-1, :] = 0.0
 
-        # --- u_z faces
-        for j in range(1, nz):
-            rho_f = 0.5 * (rho[:, j - 1] + rho[:, j])
-            mu_f = 0.5 * (mu[:, j - 1] + mu[:, j])
-            A_f = 0.5 * (A_darcy[:, j - 1] + A_darcy[:, j])
-            Fz_f = 0.5 * (Fz_s[:, j - 1] + Fz_s[:, j]) + 0.5 * (self.Fz[:, j - 1] + self.Fz[:, j])
-
-            wi = w[:, j]
-            wt = w[:, j + 1] if j + 1 <= nz else w[:, j]
-            wb = w[:, j - 1]
-            u_adv = 0.5 * (
-                0.5 * (u[:-1, j - 1] + u[1:, j - 1]) + 0.5 * (u[:-1, j] + u[1:, j])
+        # --- u_z faces j=1..nz-1 (vectorized)
+        if nz >= 2:
+            rho_f = 0.5 * (rho[:, :-1] + rho[:, 1:])
+            mu_f = 0.5 * (mu[:, :-1] + mu[:, 1:])
+            A_f = 0.5 * (A_darcy[:, :-1] + A_darcy[:, 1:])
+            Fz_f = 0.5 * (Fz_s[:, :-1] + Fz_s[:, 1:]) + 0.5 * (self.Fz[:, :-1] + self.Fz[:, 1:])
+            wi = w[:, 1:-1]
+            wt = w[:, 2:]
+            wb = w[:, :-2]
+            u_adv = 0.25 * (
+                u[:-1, :-1] + u[1:, :-1] + u[:-1, 1:] + u[1:, 1:]
             )
             dwdz = np.where(wi >= 0.0, (wi - wb) / dz, (wt - wi) / dz)
-            we = np.empty(nr)
-            ww = np.empty(nr)
-            we[:-1] = wi[1:]
-            we[-1] = wi[-1]
-            ww[1:] = wi[:-1]
-            ww[0] = wi[0]
+            we = np.empty_like(wi)
+            ww = np.empty_like(wi)
+            we[:-1, :] = wi[1:, :]
+            we[-1, :] = wi[-1, :]
+            ww[1:, :] = wi[:-1, :]
+            ww[0, :] = wi[0, :]
             dwdr = np.where(u_adv >= 0.0, (wi - ww) / dr, (we - wi) / dr)
             adv = u_adv * dwdr + wi * dwdz
-
             d2z = (wt - 2.0 * wi + wb) / dz**2
             d2r = (we - 2.0 * wi + ww) / dr**2
-            # axisymmetric: (1/r)∂/∂r(r ∂w/∂r) ≈ d2r + (1/r) dw/dr
-            inv_r = 1.0 / (self.rc + 1e-16)
+            inv_r = 1.0 / (self.rc[:, None] + 1e-16)
             visc = (mu_f / rho_f) * (d2r + inv_r * (we - ww) / (2 * dr) + d2z)
-
-            grav = -p.g  # z upward
-            buoy = p.g * m.beta * (0.5 * (self.T[:, j - 1] + self.T[:, j]) - m.T_ref)
-            # buoyancy only in liquid metal
-            fL_f = 0.5 * (fL[:, j - 1] + fL[:, j])
-            a_f = 0.5 * (alpha[:, j - 1] + alpha[:, j])
-            body = Fz_f / rho_f + grav + buoy * fL_f * a_f
-            w_star[:, j] = (wi + dt * (-adv + visc + body)) / (1.0 + dt * A_f / rho_f)
+            T_f = 0.5 * (self.T[:, :-1] + self.T[:, 1:])
+            fL_f = 0.5 * (fL[:, :-1] + fL[:, 1:])
+            a_f = 0.5 * (alpha[:, :-1] + alpha[:, 1:])
+            buoy = p.g * m.beta * (T_f - m.T_ref)
+            body = Fz_f / rho_f - p.g + buoy * fL_f * a_f
+            w_star[:, 1:-1] = (wi + dt * (-adv + visc + body)) / (1.0 + dt * A_f / rho_f)
 
         w_star[:, 0] = 0.0
-        w_star[:, -1] = 0.0
-        # outlet / top BC: zero gradient for gas, feed handled later
         w_star[:, -1] = w_star[:, -2]
 
         self._project(u_star, w_star, dt)
-        # Magnitude clip so |u|_max in the log cannot exceed u_clip
-        # (component-wise ±u_clip allowed √2·u_clip on the diagonal).
         uc = p.u_clip
         u_c = 0.5 * (u_star[:-1, :] + u_star[1:, :])
         w_c = 0.5 * (w_star[:, :-1] + w_star[:, 1:])
@@ -834,111 +850,145 @@ class WeldPoolAxi:
         self.u = u_star
         self.w = w_star
 
+    def _harmonic_rho_faces(self, rho: np.ndarray):
+        """Return inv(ρ) on radial faces (nr+1,nz) and axial faces (nr,nz+1)."""
+        nr, nz = rho.shape
+        inv_r = np.empty((nr + 1, nz), dtype=np.float64)
+        inv_r[0, :] = 1.0 / rho[0, :]
+        inv_r[-1, :] = 1.0 / rho[-1, :]
+        inv_r[1:-1, :] = 0.5 * (1.0 / rho[:-1, :] + 1.0 / rho[1:, :])
+        inv_z = np.empty((nr, nz + 1), dtype=np.float64)
+        inv_z[:, 0] = 1.0 / rho[:, 0]
+        inv_z[:, -1] = 1.0 / rho[:, -1]
+        inv_z[:, 1:-1] = 0.5 * (1.0 / rho[:, :-1] + 1.0 / rho[:, 1:])
+        return inv_r, inv_z
+
+    def _assemble_proj_matrix(self, inv_rho_r: np.ndarray, inv_rho_z: np.ndarray):
+        """Vectorized variable-density axi Poisson matrix."""
+        p = self.proc
+        nr, nz = p.nr, p.nz
+        dr, dz = self.dr, self.dz
+        N = nr * nz
+        rc = self.rc
+        ru = self.ru
+
+        rows: list = []
+        cols: list = []
+        data: list = []
+
+        # Pin (0,0)
+        rows.append(0)
+        cols.append(0)
+        data.append(1.0)
+
+        ii, jj = np.meshgrid(np.arange(nr), np.arange(nz), indexing="ij")
+        idx = (ii * nz + jj).ravel()
+
+        # East: i -> i+1 for i < nr-1, skip (0,0)
+        mask_e = (ii < nr - 1) & ~((ii == 0) & (jj == 0))
+        i_e = ii[mask_e]
+        j_e = jj[mask_e]
+        r_idx = (i_e * nz + j_e)
+        c_idx = ((i_e + 1) * nz + j_e)
+        coef_e = (ru[i_e + 1] / (rc[i_e] * dr)) * inv_rho_r[i_e + 1, j_e] / dr
+        rows.extend(r_idx.tolist())
+        cols.extend(c_idx.tolist())
+        data.extend(coef_e.tolist())
+
+        # West
+        mask_w = (ii > 0) & ~((ii == 0) & (jj == 0))
+        i_w = ii[mask_w]
+        j_w = jj[mask_w]
+        r_idx = (i_w * nz + j_w)
+        c_idx = ((i_w - 1) * nz + j_w)
+        coef_w = (ru[i_w] / (rc[i_w] * dr)) * inv_rho_r[i_w, j_w] / dr
+        rows.extend(r_idx.tolist())
+        cols.extend(c_idx.tolist())
+        data.extend(coef_w.tolist())
+
+        # North
+        mask_n = (jj < nz - 1) & ~((ii == 0) & (jj == 0))
+        i_n = ii[mask_n]
+        j_n = jj[mask_n]
+        r_idx = (i_n * nz + j_n)
+        c_idx = (i_n * nz + (j_n + 1))
+        coef_n = inv_rho_z[i_n, j_n + 1] / dz**2
+        rows.extend(r_idx.tolist())
+        cols.extend(c_idx.tolist())
+        data.extend(coef_n.tolist())
+
+        # South
+        mask_s = (jj > 0) & ~((ii == 0) & (jj == 0))
+        i_s = ii[mask_s]
+        j_s = jj[mask_s]
+        r_idx = (i_s * nz + j_s)
+        c_idx = (i_s * nz + (j_s - 1))
+        coef_s = inv_rho_z[i_s, j_s] / dz**2
+        rows.extend(r_idx.tolist())
+        cols.extend(c_idx.tolist())
+        data.extend(coef_s.tolist())
+
+        # Diagonal = -sum of off-diagonals (build via COO then sum duplicates)
+        A_off = sparse.coo_matrix((data, (rows, cols)), shape=(N, N)).tocsr()
+        diag = np.array(A_off.sum(axis=1)).ravel()
+        # For pinned node keep 1; for others -sum of neighbor coeffs already in A_off as positive
+        # We stored neighbor coeffs positive; diag should be negative sum
+        diag_vals = -diag
+        diag_vals[0] = 1.0
+        A = A_off + sparse.diags(diag_vals, 0, shape=(N, N), format="csr")
+        # Zero off-diagonal couplings into/from pin row 0 except diag
+        A = A.tolil()
+        A[0, :] = 0.0
+        A[0, 0] = 1.0
+        return A.tocsc()
+
     def _project(self, u_star: np.ndarray, w_star: np.ndarray, dt: float) -> None:
-        """Variable-density pressure projection, axisymmetric."""
+        """Variable-density pressure projection (vectorized, infrequent refactorize)."""
         p = self.proc
         nr, nz = p.nr, p.nz
         dr, dz = self.dr, self.dz
         rho = self._rho()
-        N = nr * nz
+        inv_rho_r, inv_rho_z = self._harmonic_rho_faces(rho)
 
-        def idx(i, j):
-            return i * nz + j
-
-        # divergence of u* (axisymmetric)
-        div = np.zeros((nr, nz))
-        for i in range(nr):
-            r_c = self.rc[i]
-            r_e = self.ru[i + 1]
-            r_w = self.ru[i]
-            div[i, :] = (r_e * u_star[i + 1, :] - r_w * u_star[i, :]) / (r_c * dr) + (
-                w_star[i, 1:] - w_star[i, :-1]
-            ) / dz
-
-        # harmonic density on faces
-        def rho_r(i, j):
-            if i <= 0:
-                return rho[0, j]
-            if i >= nr:
-                return rho[nr - 1, j]
-            return 2.0 / (1.0 / rho[i - 1, j] + 1.0 / rho[i, j])
-
-        def rho_z(i, j):
-            if j <= 0:
-                return rho[i, 0]
-            if j >= nz:
-                return rho[i, nz - 1]
-            return 2.0 / (1.0 / rho[i, j - 1] + 1.0 / rho[i, j])
-
-        rows, cols, data = [], [], []
+        # axisymmetric divergence
+        div = (
+            (self.ru[1:, None] * u_star[1:, :] - self.ru[:-1, None] * u_star[:-1, :])
+            / (self.rc[:, None] * dr)
+            + (w_star[:, 1:] - w_star[:, :-1]) / dz
+        )
         rhs = (div / dt).ravel(order="C")
+        rhs[0] = 0.0
 
-        for i in range(nr):
-            for j in range(nz):
-                r = idx(i, j)
-                if i == 0 and j == 0:
-                    rows.append(r)
-                    cols.append(r)
-                    data.append(1.0)
-                    rhs[r] = 0.0
-                    continue
-                diag = 0.0
-                r_c = self.rc[i]
-                # east
-                if i + 1 < nr:
-                    rf = self.ru[i + 1]
-                    coef = (rf / (r_c * dr)) * (1.0 / rho_r(i + 1, j)) / dr
-                    rows.append(r)
-                    cols.append(idx(i + 1, j))
-                    data.append(coef)
-                    diag -= coef
-                # west
-                if i - 1 >= 0:
-                    rf = self.ru[i]
-                    coef = (rf / (r_c * dr)) * (1.0 / rho_r(i, j)) / dr
-                    rows.append(r)
-                    cols.append(idx(i - 1, j))
-                    data.append(coef)
-                    diag -= coef
-                # north
-                if j + 1 < nz:
-                    coef = (1.0 / rho_z(i, j + 1)) / dz**2
-                    rows.append(r)
-                    cols.append(idx(i, j + 1))
-                    data.append(coef)
-                    diag -= coef
-                # south
-                if j - 1 >= 0:
-                    coef = (1.0 / rho_z(i, j)) / dz**2
-                    rows.append(r)
-                    cols.append(idx(i, j - 1))
-                    data.append(coef)
-                    diag -= coef
-                rows.append(r)
-                cols.append(r)
-                data.append(diag if diag != 0.0 else 1.0)
+        rebuild = (
+            self._proj_solve is None
+            or (self._step_count - self._proj_built_at) >= max(1, p.proj_rebuild_every)
+        )
+        if rebuild:
+            A = self._assemble_proj_matrix(inv_rho_r, inv_rho_z)
+            try:
+                self._proj_solve = factorized(A)
+                self._proj_built_at = self._step_count
+            except Exception:
+                self._proj_solve = None
+                return
 
-        A = sparse.csr_matrix((data, (rows, cols)), shape=(N, N))
         try:
-            phi = spsolve(A, rhs).reshape((nr, nz), order="C")
+            phi = self._proj_solve(rhs).reshape((nr, nz), order="C")
         except Exception:
             return
         if phi is None or np.any(~np.isfinite(phi)):
             return
         self.p = phi
 
-        # correct velocities
-        for i in range(1, nr):
-            rho_f = np.array([rho_r(i, j) for j in range(nz)])
-            u_star[i, :] -= (dt / rho_f) * (phi[i, :] - phi[i - 1, :]) / dr
-        for j in range(1, nz):
-            rho_f = np.array([rho_z(i, j) for i in range(nr)])
-            w_star[:, j] -= (dt / rho_f) * (phi[:, j] - phi[:, j - 1]) / dz
+        # velocity correction (vectorized)
+        rho_rf = 1.0 / np.maximum(inv_rho_r[1:-1, :], 1e-30)  # faces i=1..nr-1
+        u_star[1:-1, :] -= (dt / rho_rf) * (phi[1:, :] - phi[:-1, :]) / dr
+        rho_zf = 1.0 / np.maximum(inv_rho_z[:, 1:-1], 1e-30)  # faces j=1..nz-1
+        w_star[:, 1:-1] -= (dt / rho_zf) * (phi[:, 1:] - phi[:, :-1]) / dz
 
         u_star[0, :] = 0.0
         u_star[-1, :] = 0.0
         w_star[:, 0] = 0.0
-        # top: allow outflow
         w_star[self.rc > self.proc.R_wire, -1] = w_star[self.rc > self.proc.R_wire, -2]
 
     # ----------------------------------------------------------- energy
@@ -953,15 +1003,11 @@ class WeldPoolAxi:
         # Gaussian arc heat on pool free surface
         q_arc = p.P_arc * (3.0 / (np.pi * p.r_b**2)) * np.exp(-3.0 * (self.R / p.r_b) ** 2)
         near_pool_iface = mag > 0.1 / min(self.dr, self.dz)
-        near_pool_iface &= (self.Z <= p.H_plate + 2e-3) & (self.Z >= p.H_plate - 2.5e-3)
-        # distribute as q * |∇α|
+        near_pool_iface &= (self.Z <= 2e-3) & (self.Z >= -2.5e-3)
         q += q_arc * mag * near_pool_iface
 
-        # Anode heating on wire/drop surface: I * U_anode spread on interface area
         tip_iface = mag > 0.1 / min(self.dr, self.dz)
-        tip_iface &= self.wire_mask | (
-            (self.Z > p.H_plate + 0.5e-3) & (self.R <= 3 * p.R_wire)
-        )
+        tip_iface &= self.wire_mask | ((self.Z > 0.5e-3) & (self.R <= 3 * p.R_wire))
         if np.any(tip_iface):
             area_w = float(np.sum(mag[tip_iface] * self.cell_area[tip_iface]))
             if area_w > 0:
@@ -1073,9 +1119,11 @@ class WeldPoolAxi:
         if self._step_count % max(1, self.proc.em_every) == 0:
             self.update_em()
         self._step_momentum(dt)
+        self._freeze_solid_velocity()
         self._apply_wire_feed(dt)
         self._advect_vof(dt)
         self._step_energy(dt)
+        self._repair_plate_vof()
         self._update_masks()
         self.t += dt
         self._step_count += 1
@@ -1153,26 +1201,72 @@ class WeldPoolAxi:
         return self.diag
 
 
-def quick_process(**overrides) -> Process:
-    base = dict(
+def process_for_mesh(
+    level: Union[MeshLevel, str] = MeshLevel.normal,
+    **overrides,
+) -> Process:
+    """Return Process preset for MeshLevel.quick / normal / fine."""
+    if not isinstance(level, MeshLevel):
+        level = MeshLevel(str(level))
+    common = dict(
         Lr=0.006,
-        Lz=0.010,
-        nr=28,
-        nz=48,
-        H_plate=0.003,
+        Lz=0.007,
+        H_plate=0.004,
         R_wire=0.0006,
-        z_wire_tip=0.0072,
-        R_drop0=0.00115,
-        v_feed=0.04,
-        I_arc=170.0,
-        P_arc=1600.0,
+        z_wire_tip=0.0040,
+        v_feed=0.035,
+        I_arc=150.0,
+        P_arc=1400.0,
         r_b=0.0025,
-        p_arc_max=250.0,
-        t_end=0.010,
-        dt_max=4.0e-5,
+        p_arc_max=80.0,
         cfl=0.2,
-        em_every=4,
-        u_clip=4.0,
+        u_clip=3.0,
+        F_em_clip=3.0e6,
+        F_csf_clip=2.0e7,
+        proj_rebuild_every=5,
+        enable_flow=True,
+        enable_em=True,
     )
+    presets = {
+        MeshLevel.quick: dict(
+            nr=28,
+            nz=56,
+            t_end=0.010,
+            dt_max=4.0e-5,
+            em_every=4,
+            R_drop0=0.00100,
+            p_arc_max=70.0,
+        ),
+        MeshLevel.normal: dict(
+            nr=40,
+            nz=72,
+            t_end=0.015,
+            dt_max=4.0e-5,
+            em_every=6,
+            R_drop0=0.00095,
+            p_arc_max=80.0,
+        ),
+        MeshLevel.fine: dict(
+            nr=56,
+            nz=96,
+            t_end=0.020,
+            dt_max=3.0e-5,
+            em_every=8,
+            R_drop0=0.00090,
+            p_arc_max=90.0,
+        ),
+    }
+    base = {**common, **presets[level]}
     base.update(overrides)
     return Process(**base)
+
+
+def quick_process(**overrides) -> Process:
+    """Compatibility wrapper → process_for_mesh(MeshLevel.quick)."""
+    return process_for_mesh(MeshLevel.quick, **overrides)
+
+
+def record_every_for_mesh(level: Union[MeshLevel, str]) -> float:
+    if not isinstance(level, MeshLevel):
+        level = MeshLevel(str(level))
+    return 0.001 if level is MeshLevel.quick else 0.002
