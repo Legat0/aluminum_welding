@@ -7655,8 +7655,8 @@ $$</p>
 <span class="kn">import</span> <span class="nn">numpy</span> <span class="k">as</span> <span class="nn">np</span>
 
 <span class="n">ROOT</span> <span class="o">=</span> <span class="n">Path</span><span class="o">.</span><span class="n">cwd</span><span class="p">()</span>
-<span class="k">if</span> <span class="n">ROOT</span><span class="o">.</span><span class="n">name</span> <span class="o">!=</span> <span class="s1">'heat+flow_model'</span><span class="p">:</span>
-    <span class="n">cand</span> <span class="o">=</span> <span class="n">ROOT</span> <span class="o">/</span> <span class="s1">'heat+flow_model'</span>
+<span class="k">if</span> <span class="n">ROOT</span><span class="o">.</span><span class="n">name</span> <span class="o">!=</span> <span class="s1">'heat+flow_2d'</span><span class="p">:</span>
+    <span class="n">cand</span> <span class="o">=</span> <span class="n">ROOT</span> <span class="o">/</span> <span class="s1">'heat+flow_2d'</span>
     <span class="k">if</span> <span class="n">cand</span><span class="o">.</span><span class="n">is_dir</span><span class="p">():</span>
         <span class="n">sys</span><span class="o">.</span><span class="n">path</span><span class="o">.</span><span class="n">insert</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="nb">str</span><span class="p">(</span><span class="n">cand</span><span class="p">))</span>
         <span class="n">MODEL_DIR</span> <span class="o">=</span> <span class="n">cand</span>

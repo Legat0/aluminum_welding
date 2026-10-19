@@ -439,7 +439,7 @@ def build_pdf(mat, m, diag, m_c, m_f, figs):
     )
     story.append(
         Paragraph(
-            "Код и интерактивный запуск: heat+flow_model/weldpool2d.py и ноутбук weld_pool_2d.ipynb. "
+            "Код и интерактивный запуск: heat+flow_2d/weldpool2d.py и ноутбук weld_pool_2d.ipynb. "
             "Контроль: баланс тепла |Q_in − Q_loss − ΔH|/Q_in, малость скорости в твёрдом, направление "
             "Марангони при dσ/dT &lt; 0, затвердевание после обнуления мощности.",
             body,
