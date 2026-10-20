@@ -21,3 +21,6 @@ Thumbs.db
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# COMSOL local scratch / prefs copies
+weldpool_2d_comsol/_scratch/

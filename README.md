@@ -7,9 +7,11 @@
 ```
 aluminum_welding/
 ├── heat+flow_2d/        # версия 1: 2D тепло + течение + затвердевание (без ЭМ)
-├── heat+flow_3dmodel/   # 3D полупластина: та же физика без ЭМ
+├── weldpool_2d_comsol/  # та же постановка в COMSOL Multiphysics 6.2
+├── heat+flow_3d/        # 3D полупластина: лаб. СК + weld_pool_3d_moving (окно с дугой)
 ├── heat+flow+em_3d_axi/ # осесимметричная (r–z) VOF: электрод, капля, ванна, ЭМ в металле
 ├── heat+flow+em_3d/     # 3D полупластина VOF: движущийся электрод, капля, ванна, ЭМ в металле
+├── chen_model/          # Chen 2020: flat 3D-ванна + LTE axi-дуга (I=95 A)
 ├── refs/
 │   ├── weld_pool/       # работы по ванне без сил Лоренца (поверхностный тепловой поток)
 │   ├── primary/         # дуга / MHD / GMAW (Murphy, Chen, Bachmann, …)
@@ -77,6 +79,10 @@ model.run(record_every=0.05)
 
 Работы с дугой и ЭМ лежат в `refs/primary` и рассчитаны на следующие версии модели.
 
+## COMSOL 6.2 — `weldpool_2d_comsol`
+
+Та же 2D-постановка (гауссов поток, фазы Al 5182, Марангони, Буссинеск, Дарси) в COMSOL Multiphysics 6.2. Нужны модули Heat Transfer и CFD. Откройте `weldpool_2d.mph` или пересоберите через `build.ps1` (см. README в папке).
+
 ## Версия с каплей и ЭМ — `heat+flow+em_3d_axi`
 
 Осесимметричный меридиональный расчёт \((r,z)\) на одной сетке: расходная проволока, рост/отрыв капли (пинч), полёт и удар в ванну со свободной поверхностью (VOF). ЭМ только в металле (аналитический пинч + потенциал в ванне); плазма дуги не моделируется. Горелка неподвижна.
@@ -105,12 +111,36 @@ jupyter notebook weld_pool_em3d.ipynb
 | `weldpool_em3d.py` | MAC 3D, VOF, CSF, Дарси, пинч / \(\mathbf{J}\times\mathbf{B}\), движущийся вход проволоки |
 | `weld_pool_em3d.ipynb` | Постановка, `QUICK`-прогон, срез \(y\approx 0\), шейка, ход \(x_e\), объём |
 
+## Chen 2020 BOP — `chen_model`
+
+Два уровня для случая **I = 95 A** (Table 1–2):
+
+1. **Baseline без плазмы** — стационарная 3D-ванна (`weldpool_chen.py`): гауссовы BC, усреднённая капля, Лоренц в металле.
+2. **LTE axi (ближе к Fig. 7)** — проволока + плазма Ar + ванна + поверхность Kim–Na (`weldpool_chen_axi.py`). Не полный 3D ArcWeld; без паров Al.
+
+```bash
+cd chen_model
+jupyter notebook weld_pool_chen_axi.ipynb   # LTE-дуга
+jupyter notebook weld_pool_chen.ipynb       # flat baseline
+```
+
+| Файл | Назначение |
+|---|---|
+| `argon_lte.py` | Упрощённые таблицы свойств Ar(T) |
+| `weldpool_chen_axi.py` | Осесимметричная LTE-дуга + ванна + \(\varphi(r)\) |
+| `weld_pool_chen_axi.ipynb` | Прогон 95 A, Fig. 7 / Fig. 5 style |
+| `make_figs_axi_95A.py` | Рисунки `fig_chen_axi_95A_*.png` |
+| `weldpool_chen.py` | 3D flat-pool baseline без плазмы |
+| `results_axi_95A.npz` / `results_95A.npz` | Сохранённые прогоны |
+
 ## Планируемые шаги
 
-1. ~~Тепло + течение + фазы, без ЭМ~~ (`heat+flow_2d`, `heat+flow_3dmodel`)  
+1. ~~Тепло + течение + фазы, без ЭМ~~ (`heat+flow_2d`, `heat+flow_3d`, в т.ч. `weld_pool_3d_moving.ipynb`)  
 2. ~~ЭМ в металле + присадка / капли (осесимметрично)~~ (`heat+flow+em_3d_axi`)  
 3. ~~Грубый 3D-демо с движущимся электродом и ударами капель~~ (`heat+flow+em_3d`)  
-4. Уточнение сетки / сопоставление с экспериментами  
+4. ~~Стационарная ванна Chen 2020 (I = 95 A)~~ (`chen_model`)  
+5. ~~LTE axi-дуга + Kim–Na поверхность (I = 95 A)~~ (`chen_model` axi)  
+6. Уточнение сетки / пары металла / сопоставление с Table 2  
 
 ## Лицензия материалов
 

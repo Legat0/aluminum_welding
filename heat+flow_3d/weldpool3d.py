@@ -80,6 +80,9 @@ class Diagnostics:
     T_frames: list = field(default_factory=list)
     fL_frames: list = field(default_factory=list)
     speed_frames: list = field(default_factory=list)
+    u_frames: list = field(default_factory=list)
+    v_frames: list = field(default_factory=list)
+    w_frames: list = field(default_factory=list)
     arc_x_frames: list = field(default_factory=list)
 
 
@@ -645,6 +648,9 @@ class WeldPool3D:
             self.diag.T_frames.append(self.T.copy())
             self.diag.fL_frames.append(self.fL.copy())
             self.diag.speed_frames.append(speed.copy())
+            self.diag.u_frames.append(u_c.copy())
+            self.diag.v_frames.append(v_c.copy())
+            self.diag.w_frames.append(w_c.copy())
             self.diag.arc_x_frames.append(self.arc_centre())
 
     def heat_balance_ratio(self) -> float:
